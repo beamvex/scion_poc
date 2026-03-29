@@ -1,4 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::Context;
 use axum::{
@@ -32,14 +39,38 @@ async fn put_iface(
     State(state): State<AppState>,
     Json(entry): Json<IfaceEntry>,
 ) -> StatusCode {
-    let mut ifaces = state.ifaces.write().await;
-    ifaces.insert(ifid, entry);
+    let bind = entry
+        .bind
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+
+    let sock = match UdpSocket::bind(bind).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(ifid, %bind, error=%e, "bind iface udp failed");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+
+    {
+        let mut ifaces = state.ifaces.write().await;
+        ifaces.insert(ifid, entry);
+    }
+    {
+        let mut socks = state.iface_socks.write().await;
+        socks.insert(ifid, Arc::new(sock));
+    }
+
     StatusCode::NO_CONTENT
 }
 
 async fn delete_iface(Path(ifid): Path<u16>, State(state): State<AppState>) -> StatusCode {
-    let mut ifaces = state.ifaces.write().await;
-    if ifaces.remove(&ifid).is_some() {
+    let removed = {
+        let mut ifaces = state.ifaces.write().await;
+        ifaces.remove(&ifid)
+    };
+    if removed.is_some() {
+        let mut socks = state.iface_socks.write().await;
+        socks.remove(&ifid);
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -54,6 +85,8 @@ struct RouteEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IfaceEntry {
     next_hop: SocketAddr,
+    #[serde(default)]
+    bind: Option<SocketAddr>,
 }
 
 #[derive(Debug, Default)]
@@ -75,6 +108,19 @@ impl RoutingTable {
 struct AppState {
     rt: Arc<RwLock<RoutingTable>>,
     ifaces: Arc<RwLock<HashMap<u16, IfaceEntry>>>,
+    iface_socks: Arc<RwLock<HashMap<u16, Arc<UdpSocket>>>>,
+    metrics: Arc<Metrics>,
+}
+
+#[derive(Debug, Default)]
+struct Metrics {
+    rx_packets: AtomicU64,
+    drop_not_scion: AtomicU64,
+    drop_fwd_meta: AtomicU64,
+    drop_end_of_path: AtomicU64,
+    drop_no_iface: AtomicU64,
+    forwarded: AtomicU64,
+    send_errors: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -264,11 +310,16 @@ async fn run_dataplane(state: AppState, data_listen: SocketAddr) -> anyhow::Resu
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let (n, peer) = sock.recv_from(&mut buf).await.context("udp recv")?;
+        state.metrics.rx_packets.fetch_add(1, Ordering::Relaxed);
         let raw = &mut buf[..n];
 
         let dst_ia = match parse_scion_dst_ia(raw) {
             Ok(ia) => ia,
             Err(e) => {
+                state
+                    .metrics
+                    .drop_not_scion
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(%peer, error=%e, "drop: not a SCION packet (or unsupported)");
                 continue;
             }
@@ -278,22 +329,37 @@ async fn run_dataplane(state: AppState, data_listen: SocketAddr) -> anyhow::Resu
         let fwd = match parse_scion_fwd_meta(raw) {
             Ok(m) => m,
             Err(e) => {
+                state
+                    .metrics
+                    .drop_fwd_meta
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(dst=%dst_key, %peer, error=%e, "drop: cannot parse forwarding meta");
                 continue;
             }
         };
 
         if fwd.curr_hf.saturating_add(1) >= fwd.total_hf {
+            state
+                .metrics
+                .drop_end_of_path
+                .fetch_add(1, Ordering::Relaxed);
             warn!(dst=%dst_key, %peer, curr_hf=fwd.curr_hf, total_hf=fwd.total_hf, "drop: end of path");
             continue;
         }
 
-        let next_hop = {
+        let (next_hop, out_sock) = {
             let ifaces = state.ifaces.read().await;
-            ifaces.get(&fwd.egress_ifid).map(|e| e.next_hop)
+            let socks = state.iface_socks.read().await;
+            let next_hop = ifaces.get(&fwd.egress_ifid).map(|e| e.next_hop);
+            let out_sock = socks.get(&fwd.egress_ifid).cloned();
+            (next_hop, out_sock)
         };
 
-        let Some(next_hop) = next_hop else {
+        let (Some(next_hop), Some(out_sock)) = (next_hop, out_sock) else {
+            state
+                .metrics
+                .drop_no_iface
+                .fetch_add(1, Ordering::Relaxed);
             warn!(dst=%dst_key, %peer, egress_ifid=fwd.egress_ifid, "no iface mapping");
             continue;
         };
@@ -305,11 +371,16 @@ async fn run_dataplane(state: AppState, data_listen: SocketAddr) -> anyhow::Resu
         let next_curr = fwd.curr_hf + 1;
         raw[fwd.curr_hf_byte_off] = c_bits | (next_curr & 0b0011_1111);
 
-        match sock.send_to(raw, next_hop).await {
+        match out_sock.send_to(raw, next_hop).await {
             Ok(_) => {
+                state.metrics.forwarded.fetch_add(1, Ordering::Relaxed);
                 info!(dst=%dst_key, %peer, %next_hop, egress_ifid=fwd.egress_ifid, curr_hf=fwd.curr_hf, "forwarded");
             }
             Err(e) => {
+                state
+                    .metrics
+                    .send_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 error!(dst=%dst_key, %peer, %next_hop, egress_ifid=fwd.egress_ifid, error=%e, "send failed");
             }
         }
@@ -334,6 +405,8 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         rt: Arc::new(RwLock::new(RoutingTable::default())),
         ifaces: Arc::new(RwLock::new(HashMap::new())),
+        iface_socks: Arc::new(RwLock::new(HashMap::new())),
+        metrics: Arc::new(Metrics::default()),
     };
 
     let mut set = JoinSet::<anyhow::Result<()>>::new();
