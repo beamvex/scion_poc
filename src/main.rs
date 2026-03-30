@@ -16,6 +16,7 @@ use axum::{
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tokio::time::{interval, Duration};
 use tokio::{
     net::UdpSocket,
     sync::RwLock,
@@ -32,6 +33,25 @@ struct Cli {
 
     #[arg(long, default_value = "127.0.0.1:4001")]
     data_listen: SocketAddr,
+
+    #[arg(long, default_value = "127.0.0.1:4010")]
+    beacon_listen: SocketAddr,
+
+    #[arg(long, default_value = "2")]
+    beacon_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BeaconPeer {
+    peer: SocketAddr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BeaconMsg {
+    ifid: u16,
+    next_hop: SocketAddr,
+    #[serde(default)]
+    bind: Option<SocketAddr>,
 }
 
 async fn put_iface(
@@ -39,28 +59,13 @@ async fn put_iface(
     State(state): State<AppState>,
     Json(entry): Json<IfaceEntry>,
 ) -> StatusCode {
-    let bind = entry
-        .bind
-        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-
-    let sock = match UdpSocket::bind(bind).await {
-        Ok(s) => s,
+    match upsert_iface(&state, ifid, entry).await {
+        Ok(()) => StatusCode::NO_CONTENT,
         Err(e) => {
-            error!(ifid, %bind, error=%e, "bind iface udp failed");
-            return StatusCode::INTERNAL_SERVER_ERROR;
+            error!(ifid, error=%e, "upsert iface failed");
+            StatusCode::INTERNAL_SERVER_ERROR
         }
-    };
-
-    {
-        let mut ifaces = state.ifaces.write().await;
-        ifaces.insert(ifid, entry);
     }
-    {
-        let mut socks = state.iface_socks.write().await;
-        socks.insert(ifid, Arc::new(sock));
-    }
-
-    StatusCode::NO_CONTENT
 }
 
 async fn delete_iface(Path(ifid): Path<u16>, State(state): State<AppState>) -> StatusCode {
@@ -75,6 +80,27 @@ async fn delete_iface(Path(ifid): Path<u16>, State(state): State<AppState>) -> S
     } else {
         StatusCode::NOT_FOUND
     }
+}
+
+async fn upsert_iface(state: &AppState, ifid: u16, entry: IfaceEntry) -> anyhow::Result<()> {
+    let bind = entry
+        .bind
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+
+    let sock = UdpSocket::bind(bind)
+        .await
+        .with_context(|| format!("bind iface udp {bind}"))?;
+
+    {
+        let mut ifaces = state.ifaces.write().await;
+        ifaces.insert(ifid, entry);
+    }
+    {
+        let mut socks = state.iface_socks.write().await;
+        socks.insert(ifid, Arc::new(sock));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +135,7 @@ struct AppState {
     rt: Arc<RwLock<RoutingTable>>,
     ifaces: Arc<RwLock<HashMap<u16, IfaceEntry>>>,
     iface_socks: Arc<RwLock<HashMap<u16, Arc<UdpSocket>>>>,
+    beacon_peers: Arc<RwLock<Vec<SocketAddr>>>,
     metrics: Arc<Metrics>,
 }
 
@@ -260,6 +287,19 @@ async fn get_ifaces(State(state): State<AppState>) -> Json<HashMap<u16, IfaceEnt
     Json(ifaces.clone())
 }
 
+async fn get_beacon_peers(State(state): State<AppState>) -> Json<Vec<SocketAddr>> {
+    let peers = state.beacon_peers.read().await;
+    Json(peers.clone())
+}
+
+async fn post_beacon_peer(State(state): State<AppState>, Json(peer): Json<BeaconPeer>) -> StatusCode {
+    let mut peers = state.beacon_peers.write().await;
+    if !peers.contains(&peer.peer) {
+        peers.push(peer.peer);
+    }
+    StatusCode::NO_CONTENT
+}
+
 async fn put_route(
     Path(dst): Path<String>,
     State(state): State<AppState>,
@@ -286,6 +326,7 @@ async fn run_http(state: AppState, http_listen: SocketAddr) -> anyhow::Result<()
         .route("/routes/:dst", post(put_route).delete(delete_route))
         .route("/ifaces", get(get_ifaces))
         .route("/ifaces/:ifid", post(put_iface).delete(delete_iface))
+        .route("/beacon/peers", get(get_beacon_peers).post(post_beacon_peer))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -298,6 +339,83 @@ async fn run_http(state: AppState, http_listen: SocketAddr) -> anyhow::Result<()
         .await
         .context("http server failed")?;
     Ok(())
+}
+
+async fn run_beacon_rx(state: AppState, beacon_listen: SocketAddr) -> anyhow::Result<()> {
+    let sock = UdpSocket::bind(beacon_listen)
+        .await
+        .with_context(|| format!("bind beacon udp {beacon_listen}"))?;
+    info!(%beacon_listen, "beacon rx listening (udp)");
+
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let (n, peer) = sock.recv_from(&mut buf).await.context("beacon recv")?;
+        let raw = &buf[..n];
+        let msg: BeaconMsg = match serde_json::from_slice(raw) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(%peer, error=%e, "drop: invalid beacon json");
+                continue;
+            }
+        };
+
+        let entry = IfaceEntry {
+            next_hop: msg.next_hop,
+            bind: msg.bind,
+        };
+
+        if let Err(e) = upsert_iface(&state, msg.ifid, entry).await {
+            warn!(%peer, ifid=msg.ifid, error=%e, "failed to apply beacon");
+            continue;
+        }
+
+        info!(%peer, ifid=msg.ifid, next_hop=%msg.next_hop, "applied beacon");
+    }
+}
+
+async fn run_beacon_tx(state: AppState, beacon_interval_secs: u64) -> anyhow::Result<()> {
+    let sock = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+        .await
+        .context("bind beacon tx socket")?;
+
+    let mut ticker = interval(Duration::from_secs(beacon_interval_secs.max(1)));
+    loop {
+        ticker.tick().await;
+
+        let peers = {
+            let peers = state.beacon_peers.read().await;
+            peers.clone()
+        };
+        if peers.is_empty() {
+            continue;
+        }
+
+        let ifaces = {
+            let ifaces = state.ifaces.read().await;
+            ifaces.clone()
+        };
+
+        for (ifid, iface) in ifaces {
+            let msg = BeaconMsg {
+                ifid,
+                next_hop: iface.next_hop,
+                bind: iface.bind,
+            };
+            let bytes = match serde_json::to_vec(&msg) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(ifid, error=%e, "beacon serialize failed");
+                    continue;
+                }
+            };
+
+            for peer in &peers {
+                if let Err(e) = sock.send_to(&bytes, peer).await {
+                    warn!(%peer, ifid, error=%e, "beacon send failed");
+                }
+            }
+        }
+    }
 }
 
 async fn run_dataplane(state: AppState, data_listen: SocketAddr) -> anyhow::Result<()> {
@@ -406,12 +524,15 @@ async fn main() -> anyhow::Result<()> {
         rt: Arc::new(RwLock::new(RoutingTable::default())),
         ifaces: Arc::new(RwLock::new(HashMap::new())),
         iface_socks: Arc::new(RwLock::new(HashMap::new())),
+        beacon_peers: Arc::new(RwLock::new(Vec::new())),
         metrics: Arc::new(Metrics::default()),
     };
 
     let mut set = JoinSet::<anyhow::Result<()>>::new();
     set.spawn(run_http(state.clone(), cli.http_listen));
     set.spawn(run_dataplane(state.clone(), cli.data_listen));
+    set.spawn(run_beacon_rx(state.clone(), cli.beacon_listen));
+    set.spawn(run_beacon_tx(state.clone(), cli.beacon_interval_secs));
 
     while let Some(res) = set.join_next().await {
         match res {
