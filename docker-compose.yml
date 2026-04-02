@@ -1,0 +1,32 @@
+services:
+  router:
+    build: .
+    environment:
+      RUST_LOG: info
+    command:
+      - "--http-listen"
+      - "0.0.0.0:3000"
+      - "--data-listen"
+      - "0.0.0.0:4001"
+      - "--beacon-listen"
+      - "0.0.0.0:4010"
+    expose:
+      - "3000"
+      - "4001/udp"
+      - "4010/udp"
+
+  lb:
+    image: nginx:1.27-alpine
+    depends_on:
+      - router
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+
+  tester:
+    image: alpine:3.20
+    depends_on:
+      - lb
+    entrypoint: ["/bin/sh", "-lc"]
+    command: ["apk add --no-cache curl netcat-openbsd >/dev/null && sleep infinity"]
