@@ -1,7 +1,9 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::Context;
 use axum::{
+    extract::State,
     http::StatusCode,
     routing::get,
     Router,
@@ -10,8 +12,15 @@ use tracing::info;
 
 use crate::state::AppState;
 
-async fn health() -> StatusCode {
-    StatusCode::OK
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Response {
+    message: String,
+}
+
+async fn health(State(_state): State<Arc<AppState>>) -> (StatusCode, axum::Json<Response>) {
+    (StatusCode::OK, axum::Json(Response { message: "OK".to_string() }))
 }
 
 pub async fn run_http(state: Arc<AppState>, http_listen: SocketAddr) -> anyhow::Result<()> {

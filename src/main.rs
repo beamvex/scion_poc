@@ -14,7 +14,9 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = cli::Cli::parse();
 
-    let state = Arc::new(state::AppState {});
+    let state = Arc::new(state::AppState {
+        peers: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    });
     
     let mut set = JoinSet::<anyhow::Result<()>>::new();
     set.spawn(http_api::run_http(Arc::clone(&state), cli.http_listen));
