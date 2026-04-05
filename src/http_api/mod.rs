@@ -11,21 +11,12 @@ use axum::{
 use tracing::info;
 
 use crate::state::AppState;
-
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct Response {
-    message: String,
-}
-
-async fn health(State(_state): State<Arc<AppState>>) -> (StatusCode, axum::Json<Response>) {
-    (StatusCode::OK, axum::Json(Response { message: "OK".to_string() }))
-}
+pub mod model;
+pub mod health;
 
 pub async fn run_http(state: Arc<AppState>, http_listen: SocketAddr) -> anyhow::Result<()> {
     let app = Router::new()
-        .route("/health", get(health))
+        .route("/health", get(health::health))
         .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(http_listen)
@@ -38,3 +29,4 @@ pub async fn run_http(state: Arc<AppState>, http_listen: SocketAddr) -> anyhow::
         .context("http server failed")?;
     Ok(())
 }
+
