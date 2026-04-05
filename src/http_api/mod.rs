@@ -3,8 +3,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::{
-    extract::State,
-    http::StatusCode,
     routing::get,
     Router,
 };
@@ -18,7 +16,7 @@ pub mod peers;
 pub async fn run_http(state: Arc<AppState>, http_listen: SocketAddr) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health::health))
-        .route("/peers", get(peers::get_peers))
+        .route("/peers", get(peers::get_peers).post(peers::add_peer))
         .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(http_listen)
