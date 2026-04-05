@@ -13,10 +13,12 @@ use tracing::info;
 use crate::state::AppState;
 pub mod model;
 pub mod health;
+pub mod peers;
 
 pub async fn run_http(state: Arc<AppState>, http_listen: SocketAddr) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health::health))
+        .route("/peers", get(peers::get_peers))
         .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(http_listen)
