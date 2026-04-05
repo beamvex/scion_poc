@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
     let state = Arc::new(state::AppState {
-        peers: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        peers: Arc::new(dashmap::DashMap::new()),
     });
     
     let mut set = JoinSet::<anyhow::Result<()>>::new();

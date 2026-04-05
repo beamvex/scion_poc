@@ -18,7 +18,7 @@ mod test {
     #[tokio::test]
     async fn test_health() {
         let state = Arc::new(AppState {
-            peers: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            peers: Arc::new(dashmap::DashMap::new()),
         });
         let response = health(State(Arc::clone(&state))).await;
         slogger::info!("Response: {response:#?}");

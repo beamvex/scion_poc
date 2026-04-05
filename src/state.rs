@@ -1,10 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 
 
 #[derive(Debug)]
 pub struct AppState {
-    pub peers: Arc<RwLock<HashMap<String, String>>>,
+    pub peers: Arc<DashMap<String, String>>,
 }
 
