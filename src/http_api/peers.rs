@@ -67,8 +67,8 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_add_peer_multithreaded() {
 
-        const CONCURRENCY: usize = 10;
-        const REQUESTS_PER_TASK: usize = 100000;
+        const CONCURRENCY: usize = 100000;
+        const REQUESTS_PER_TASK: usize = 1;
 
         let state = Arc::new(AppState {
             peers: Arc::new(dashmap::DashMap::new()),
